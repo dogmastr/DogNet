@@ -68,10 +68,8 @@ In our tests DogNet was the fastest and smallest of the libraries we compared (B
 
 DogNet is one ModuleScript, `DogNet`, with a few ModuleScripts inside it. It must be in **ReplicatedStorage**, so the server and clients can both require it.
 
-<!-- TODO: link to a downloadable DogNet.rbxm or Creator Store model once there is one. -->
-
-- **In Studio:** insert the `DogNet` ModuleScript into ReplicatedStorage.
-- **With Rojo or Argon:** copy the `DogNet` folder into the folder you sync to ReplicatedStorage.
+- **In Studio:** download [DogNet.rbxm](https://github.com/dogmastr/DogNet/releases/latest/download/DogNet.rbxm) from the latest release. In Studio, right-click **ReplicatedStorage**, choose **Insert from File...**, and pick the file.
+- **With Rojo or Argon:** copy the `DogNet` folder into the folder you sync to ReplicatedStorage. Its `init.luau` becomes the `DogNet` ModuleScript, and the other files go inside it.
 
 ## Quick start
 
