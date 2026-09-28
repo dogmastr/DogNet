@@ -92,10 +92,10 @@ end
 
 local function flush()
 	if reliable.cursor > 0 then
-		if IS_STUDIO and reliable.cursor > MAX_BATCH_SIZE and not warnedBatchSize then
+		if IS_STUDIO and not warnedBatchSize and Serdes.cost(reliable) > MAX_BATCH_SIZE then
 			warnedBatchSize = true
 			warn(
-				`[DogNet] this client sent {reliable.cursor} bytes in one frame; the server rejects batches over {MAX_BATCH_SIZE} bytes (MAX_BUFFER_SIZE)`
+				`[DogNet] this client sent {Serdes.cost(reliable)} bytes in one frame, counting Instances and other refs; the server rejects batches over {MAX_BATCH_SIZE} bytes (MAX_BUFFER_SIZE)`
 			)
 		end
 		fire(reliableRemote, reliable)

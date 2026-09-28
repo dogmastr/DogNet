@@ -59,7 +59,12 @@ local FAILURE_REASONS: { [number]: string } = {
 local SWEEP_INTERVAL = 0.25
 -- Seconds the id of a call that timed out stays unused.
 local QUARANTINE = 60
-local MAX_CALLS = 65536
+-- Ids below 2^20 take at most three bytes. Only a backlog reaches past 16384.
+local MAX_CALLS = 1048576
+-- Server only: ids calls to one player may hold, waiting or set aside after
+-- timing out. Every player's calls share the ids, so without this a few
+-- clients that never answer could use them all up.
+local MAX_CALLS_PER_PLAYER = 1024
 
 local pending: { [number]: Call } = {}
 local pendingCount = 0
@@ -72,6 +77,10 @@ local freshId = 0
 -- Ids of calls that timed out, and when each can be reused.
 local quarantined: { [number]: number } = {}
 local quarantineCount = 0
+-- Server only: the player each quarantined id's call went to, and how many
+-- ids each player's calls hold (see MAX_CALLS_PER_PLAYER).
+local quarantinedFor: { [number]: Player } = {}
+local playerCalls: { [Player]: number } = {}
 
 local function traceback(message: any): string
 	return debug.traceback(tostring(message), 2)
@@ -103,6 +112,17 @@ local function releaseCallId(callId: number)
 	freeIds[freeCount] = callId
 end
 
+local function unhold(player: Player)
+	local held = playerCalls[player]
+	if held then
+		if held > 1 then
+			playerCalls[player] = held - 1
+		else
+			playerCalls[player] = nil
+		end
+	end
+end
+
 local function settle(callId: number, sender: Player?, responseId: number?, ok: boolean, value: any)
 	local call = pending[callId]
 	-- A response must come from whoever was asked, for the query that was asked.
@@ -112,6 +132,10 @@ local function settle(callId: number, sender: Player?, responseId: number?, ok: 
 	pending[callId] = nil
 	pendingCount -= 1
 	releaseCallId(callId)
+	local player = call.player
+	if player then
+		unhold(player)
+	end
 	task.spawn(call.thread, ok, value)
 end
 
@@ -130,6 +154,11 @@ local function sweep()
 				quarantined[callId] = nil
 				quarantineCount -= 1
 				releaseCallId(callId)
+				local player = quarantinedFor[callId]
+				if player then
+					quarantinedFor[callId] = nil
+					unhold(player)
+				end
 			end
 		end
 	end
@@ -142,6 +171,11 @@ local function sweep()
 			pendingCount -= 1
 			quarantined[callId] = now + QUARANTINE
 			quarantineCount += 1
+			-- Still held by that player's calls until it's reused.
+			local player = call.player
+			if player then
+				quarantinedFor[callId] = player
+			end
 			expired = expired or {}
 			table.insert(expired :: { Call }, call)
 		end
@@ -186,6 +220,8 @@ if IS_SERVER then
 				table.insert(orphaned, call)
 			end
 		end
+		-- Ids still set aside for them are counted for no one.
+		playerCalls[player] = nil
 		for _, call in orphaned do
 			task.spawn(call.thread, false, "the player left")
 		end
@@ -285,6 +321,11 @@ function Query.create(
 				error(`[DogNet] {label}.invoke on the server needs the player to ask: invoke(request, player)`, 2)
 			elseif Server.state(player :: Player) == nil then
 				error(`[DogNet] {label}.invoke: that player isn't in the game`, 2)
+			elseif (playerCalls[player :: Player] or 0) >= MAX_CALLS_PER_PLAYER then
+				error(
+					`[DogNet] {label}.invoke: that player has {MAX_CALLS_PER_PLAYER} calls unanswered or timed out in the last {QUARANTINE} seconds`,
+					2
+				)
 			end
 		end
 
@@ -292,6 +333,10 @@ function Query.create(
 		local callId = nextCallId()
 		send(player, id, callId, writeRequest, request)
 		takeCallId()
+		if IS_SERVER then
+			local asked = player :: Player
+			playerCalls[asked] = (playerCalls[asked] or 0) + 1
+		end
 
 		pending[callId] = {
 			thread = coroutine.running(),

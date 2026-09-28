@@ -269,6 +269,12 @@ local function flush()
 	if #reliableQueue == 0 then
 		if broadcast.cursor > 0 then
 			fire(reliableRemote, broadcast, nil)
+			-- Everyone read its array counts (see Serdes.shareCounts).
+			if broadcast.countKeys then
+				for _, state in states do
+					Serdes.shareCounts(state.reliable, broadcast)
+				end
+			end
 		end
 	else
 		if broadcast.cursor > 0 then
@@ -280,6 +286,9 @@ local function flush()
 						reliableRemote:FireClient(player, batch, refs)
 					else
 						reliableRemote:FireClient(player, batch)
+					end
+					if state and broadcast.countKeys then
+						Serdes.shareCounts(state.reliable, broadcast)
 					end
 				end
 			end
@@ -352,21 +361,37 @@ local function receive(player: Player, batch: any, refs: any, reliable: boolean)
 			problem = "rate limit exceeded"
 		else
 			state.budget -= length
-			local stoppedAt, _, badId, failure = Serdes.process(
-				batch,
-				refs,
-				player,
-				Registry.readers,
-				Registry.targets,
-				false,
-				0,
-				0,
-				if reliable then state.readShapes else nil
-			)
-			if failure ~= nil then
-				problem = `malformed batch ({failure})`
-			elseif stoppedAt then
-				problem = `unknown message id {badId}`
+			-- Refs count too: Roblox sent them along, and `unknown` can carry anything.
+			local refsCost = if refs == nil then 0 else Serdes.refsCost(refs, state.budget)
+			if refsCost == nil then
+				problem = "malformed refs"
+				state.budget = 0
+			elseif refsCost > state.budget then
+				problem = "rate limit exceeded"
+				-- Nothing more from this player is read until the budget refills.
+				state.budget = 0
+			else
+				state.budget -= refsCost
+				-- Zero-byte items (Instances in an array, say) cost a byte each,
+				-- out of what's left.
+				local stoppedAt, _, badId, failure, zeroItems = Serdes.process(
+					batch,
+					refs,
+					player,
+					Registry.readers,
+					Registry.targets,
+					false,
+					0,
+					0,
+					if reliable then state.readShapes else nil,
+					state.budget
+				)
+				state.budget -= zeroItems
+				if failure ~= nil then
+					problem = `malformed batch ({failure})`
+				elseif stoppedAt then
+					problem = `unknown message id {badId}`
+				end
 			end
 		end
 	end

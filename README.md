@@ -413,8 +413,9 @@ type HealthPacket = DogNet.Packet<{ hp: number }>
 Exploiters can send anything a client can send, as often as they like. DogNet protects the parts it can:
 
 - Data from a client is checked against the packet's type. Malformed data is thrown away, so your listener never sees it.
-- Each player has a byte budget (a rate limit). Data over it is dropped with a warning in the output.
+- Each player has a byte budget (a rate limit). Data over it is dropped with a warning in the output. Instances and other values Roblox sends along count toward it, and so does each item that takes no bytes of its own (an Instance in a list or map, or a string repeated in a list), so a tiny message can't make the server do a lot of work.
 - A client can only have so many queries waiting on the server at once.
+- When the server asks a client with `invoke`, a client that never answers only holds up calls to itself: once too many of its calls are unanswered, new ones to that player fail straight away.
 
 What DogNet can't check is whether the data **makes sense**. That's your job, in every listener and query handler on the server:
 
@@ -453,6 +454,8 @@ DogNet reads them once, the first time it's required, so set them in Studio befo
 
 If a client legitimately sends more than 8 KB in one frame (the output warns you in Studio) or more than 8 KB a second on average, raise `MAX_BUFFER_SIZE`. `RATE_LIMIT` follows it unless you set it too.
 
+Besides the bytes of the data, each Instance a client sends counts as about 6 bytes, plus 1 when it's in a list or map, and each repeat of the same string in a list counts as 1 byte.
+
 ## Troubleshooting
 
 Every DogNet message in the output starts with `[DogNet]`.
@@ -469,12 +472,13 @@ Every DogNet message in the output starts with `[DogNet]`.
 | `invoke failed: no response within N seconds` | Nothing answered in time. | Make sure the other side calls `listen` on the query and that the handler returns. |
 | `invoke failed: nothing is handling it` | The other side has no handler for this query. | Call `listen` on the query on the other side. |
 | `invoke failed: its handler errored` | The handler hit an error. | The handler's own error is in the output of the side that answered (`... handler errored: ...`). |
+| `invoke: that player has 1024 calls unanswered` | The server kept asking a client that didn't answer. | Make sure the client calls `listen` on the query. If the client is an exploiter, only calls to that player fail. |
 | `... returned a value that doesn't match the response type` | The handler returned the wrong kind of value, or nothing when a value was expected. | Return a value of the `response` type. |
 | `already had a handler and this one replaces it` | `listen` was called twice on one query. | A query has one handler: combine them, or disconnect the old one first. |
 | `got more than 256 messages before anything listened` | A client received many messages before it connected a listener for that packet. | Connect the listener earlier, or send less before it's ready. |
 | `an unreliable message ... is over the 950 byte limit` | One unreliable message was too big for Roblox. | Send less at once, or make the packet reliable. It was sent reliably this time. |
 | `this client sent N bytes in one frame` | A client sent more in one frame than the server accepts. | Send less per frame, or raise `MAX_BUFFER_SIZE`. |
-| `dropped data from Player: rate limit exceeded` | A player sent more than their byte budget. | Normal for exploiters. If a real player hits it, raise `RATE_LIMIT`. |
+| `dropped data from Player: rate limit exceeded` | A player sent more than their byte budget. Instances and repeated strings count too (see Settings). | Normal for exploiters. If a real player hits it, raise `RATE_LIMIT`. |
 | `dropped data from Player: malformed batch` | Data from a player didn't match its types. | Usually an exploiter. If it happens in normal play, check both sides use the same DogNet version. |
 
 ## How it works

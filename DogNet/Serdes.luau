@@ -50,6 +50,9 @@ export type Channel = {
 	refCount: number,
 	-- Key sets the receiver remembers, on a reliable channel to one peer.
 	shapes: Shapes?,
+	-- Array codecs (their count keys) with a count written here without
+	-- remembering it. See `passCounts`.
+	countKeys: { [any]: boolean }?,
 }
 
 --[[
@@ -117,7 +120,8 @@ export type Listener = (value: any, sender: Player?) -> ()
 
 -- Roblox charges roughly this many bytes per ref on an UnreliableRemoteEvent.
 local REF_COST = 6
--- Caps counts of zero-byte items (e.g. arrays of Instances) read from clients.
+-- Zero-byte items (e.g. Instances in an array) one batch from a client may
+-- hold when `process` is given no allowance, and repeats in one string array.
 local MAX_ZERO_SIZE_COUNT = 4096
 local AUTO_MAX_DEPTH = 32
 local SQRT2 = math.sqrt(2)
@@ -191,6 +195,7 @@ function Serdes.channel(): Channel
 		refs = {},
 		refCount = 0,
 		shapes = nil,
+		countKeys = nil,
 	}
 end
 
@@ -386,6 +391,7 @@ function Serdes.reset(channel: Channel)
 	end
 	channel.cursor = 0
 	channel.refCount = 0
+	channel.countKeys = nil
 	if next(channel.refs) ~= nil then
 		table.clear(channel.refs)
 	end
@@ -396,8 +402,109 @@ function Serdes.cost(channel: Channel): number
 	return channel.cursor + channel.refCount * REF_COST
 end
 
+-- Adds to `total` the least Roblox's encoding of `value` takes beyond its
+-- type: string and buffer contents, and two bytes per table entry plus what
+-- its keys and values take. Stops adding once past `limit`. Nil for tables
+-- nested deeper than `auto` allows.
+local function addRefContents(value: any, total: number, limit: number, depth: number): number?
+	local kind = type(value)
+	if kind == "string" then
+		return total + string.len(value)
+	elseif kind == "buffer" then
+		return total + buffer.len(value)
+	elseif kind ~= "table" then
+		return total
+	elseif depth >= AUTO_MAX_DEPTH then
+		return nil
+	end
+	for key, entry in value do
+		if total > limit then
+			break
+		end
+		local sum = addRefContents(key, total + 2, limit, depth + 1)
+		if sum == nil then
+			return nil
+		end
+		sum = addRefContents(entry, sum, limit, depth + 1)
+		if sum == nil then
+			return nil
+		end
+		total = sum
+	end
+	return total
+end
+
+--[[
+	Roughly what refs from a client took to send, to charge against its byte
+	budget along with the batch: REF_COST per ref, plus the contents of any
+	strings, buffers or tables among them (`unknown` passes on anything
+	Roblox can send). Stops counting once past `limit`, so checking a huge
+	table costs no more than the budget allows. Nil if they can't be refs
+	DogNet wrote: a key that isn't a number, or tables nested deeper than
+	`auto` allows.
+]]
+function Serdes.refsCost(refs: { any }, limit: number): number?
+	local total = 0
+	for key, value in refs do
+		if type(key) ~= "number" then
+			return nil
+		end
+		local sum = addRefContents(value, total + REF_COST, limit, 0)
+		if sum == nil then
+			return nil
+		end
+		total = sum
+		if total > limit then
+			break
+		end
+	end
+	return total
+end
+
+--[[
+	A reader that remembers array counts stores every count it reads, also
+	those written without remembering: a broadcast, or a message encoded once
+	for several players, spliced into a player's stream or fired to them as
+	is. The writer that remembers for that reader never saw those counts, so
+	it would send "same count" for a length the reader no longer has. When
+	such bytes reach a reader, the channel that remembers for it forgets the
+	counts of those arrays and sends their next counts in full.
+]]
+local function passCounts(target: Channel, keys: { [any]: boolean })
+	local shapes = target.shapes
+	if shapes then
+		local counts = shapes.lastCounts
+		for key in keys do
+			counts[key] = nil
+		end
+	else
+		-- Passed on again if these bytes go further (a broadcast spliced in).
+		local own = target.countKeys
+		if own == nil then
+			own = {}
+			target.countKeys = own
+		end
+		for key in keys do
+			own[key] = true
+		end
+	end
+end
+
+-- `source`'s bytes reached `target`'s reader another way than through
+-- `target` (a broadcast batch fired to that player as is): see `passCounts`.
+function Serdes.shareCounts(target: Channel, source: Channel)
+	local keys = source.countKeys
+	if keys then
+		passCounts(target, keys)
+	end
+end
+
 -- Appends bytes [from, to) and refs (refFrom, refTo] of `source` to `target`.
 function Serdes.append(target: Channel, source: Channel, from: number, to: number, refFrom: number, refTo: number)
+	local keys = source.countKeys
+	if keys then
+		passCounts(target, keys)
+	end
 	begin(target)
 	local length = to - from
 	if wcursor + length > wsize then
@@ -540,6 +647,10 @@ local rtrusted = true
 local rsender: Player? = nil
 -- Key sets the sender's stream remembers, if the batch came on one.
 local rshapes: Shapes? = nil
+-- Zero-byte items (and repeats in string arrays) the untrusted batch being
+-- read may still hold. They take no room in the batch, so its length can't
+-- bound them; `process` sets this.
+local rzeroLeft = 0
 local rreaders: { [number]: Reader } = {}
 local rtargets: { [number]: { Listener } } = {}
 
@@ -724,6 +835,10 @@ end
 	retry the rest. If the data can't be read, the fourth result is the error.
 	Listener errors are reported and don't stop the batch. `shapes` is the
 	key sets of the stream the batch came on, if it remembers any.
+	`zeroAllowance` is how many zero-byte items (Instances in an array, say,
+	or repeats in a string array) an untrusted batch may hold in all,
+	MAX_ZERO_SIZE_COUNT if not given; the fifth result is how many it read,
+	for the caller to charge.
 ]]
 function Serdes.process(
 	buff: buffer,
@@ -734,8 +849,9 @@ function Serdes.process(
 	trusted: boolean,
 	cursor: number,
 	refIndex: number,
-	shapes: Shapes?
-): (number?, number?, number?, any)
+	shapes: Shapes?,
+	zeroAllowance: number?
+): (number?, number?, number?, any, number)
 	-- A stalled trusted batch keeps its place: set it aside and put it back after.
 	local stalled: { any }? = nil
 	if trustedStalled then
@@ -756,6 +872,8 @@ function Serdes.process(
 		trustedStalled = false
 	end
 	startBatch(buff, refs, sender, readers, targets, trusted, cursor, refIndex, shapes)
+	local zeroAllowed = math.max(zeroAllowance or MAX_ZERO_SIZE_COUNT, 0)
+	rzeroLeft = zeroAllowed
 
 	local failure: any = nil
 	while true do
@@ -796,10 +914,12 @@ function Serdes.process(
 		finished = false
 		trustedStalled = true
 	end
+	-- No more than the allowance, even if the batch asked for more.
+	local zeroRead = zeroAllowed - math.max(rzeroLeft, 0)
 	if failure ~= nil then
-		return nil, nil, nil, failure
+		return nil, nil, nil, failure, zeroRead
 	end
-	return at, ref, id, nil
+	return at, ref, id, nil, zeroRead
 end
 
 --[[
@@ -973,7 +1093,9 @@ function Serdes.readU8(): number
 end
 
 -- Refuses counts that can't possibly fit in what's left of an untrusted batch,
--- so a forged length can't make us allocate or loop without bound.
+-- so a forged length can't make us allocate or loop without bound. Items that
+-- take no bytes come out of the batch's allowance instead (see `process`):
+-- one for all of its collections, so repeating one doesn't multiply them.
 local function checkCount(count: number, minSize: number)
 	if rtrusted then
 		return
@@ -982,8 +1104,11 @@ local function checkCount(count: number, minSize: number)
 		if count * minSize > buffer.len(rbuff) - rcursor then
 			error("count exceeds remaining data", 0)
 		end
-	elseif count > MAX_ZERO_SIZE_COUNT then
-		error("count too large", 0)
+	else
+		rzeroLeft -= count
+		if rzeroLeft < 0 then
+			error("too many zero-byte items", 0)
+		end
 	end
 end
 
@@ -1098,6 +1223,15 @@ local function writeArrayCount(key: any, count: number)
 		end
 		counts[key] = count
 		wtouched = shapes
+	else
+		-- A reader that remembers counts may still read this one (see passCounts).
+		local channel = wchannel :: Channel
+		local keys = channel.countKeys
+		if keys == nil then
+			keys = {}
+			channel.countKeys = keys
+		end
+		keys[key] = true
 	end
 	if count < SAME_COUNT then
 		buffer.writeu8(wbuff, wcursor, count)
@@ -1659,6 +1793,10 @@ function Serdes.enum(values: { any }): Codec
 			wcursor += 1
 		end, function(): any
 			local value = values[buffer.readu8(rbuff, rcursor) + 1]
+			-- `== nil`: false can be one of the values.
+			if value == nil and not rtrusted then
+				error("invalid enum value", 0)
+			end
 			rcursor += 1
 			return value
 		end)
@@ -1668,6 +1806,9 @@ function Serdes.enum(values: { any }): Codec
 		wcursor += 2
 	end, function(): any
 		local value = values[buffer.readu16(rbuff, rcursor) + 1]
+		if value == nil and not rtrusted then
+			error("invalid enum value", 0)
+		end
 		rcursor += 2
 		return value
 	end)
@@ -1698,6 +1839,9 @@ function Serdes.enumItem(enumType: Enum): Codec
 			wcursor += 1
 		end, function(): EnumItem
 			local item = byValue[buffer.readu8(rbuff, rcursor)]
+			if item == nil and not rtrusted then
+				error("invalid enumItem value", 0)
+			end
 			rcursor += 1
 			return item
 		end)
@@ -1707,6 +1851,9 @@ function Serdes.enumItem(enumType: Enum): Codec
 			wcursor += 2
 		end, function(): EnumItem
 			local item = byValue[buffer.readu16(rbuff, rcursor)]
+			if item == nil and not rtrusted then
+				error("invalid enumItem value", 0)
+			end
 			rcursor += 2
 			return item
 		end)
@@ -1716,6 +1863,9 @@ function Serdes.enumItem(enumType: Enum): Codec
 		wcursor += 4
 	end, function(): EnumItem
 		local item = byValue[buffer.readi32(rbuff, rcursor)]
+		if item == nil and not rtrusted then
+			error("invalid enumItem value", 0)
+		end
 		rcursor += 4
 		return item
 	end)
@@ -2300,6 +2450,14 @@ local function readStringRuns(count: number): { string }
 	if runs > count or runs * 2 > length - rcursor or count - runs > MAX_ZERO_SIZE_COUNT then
 		error("malformed string array", 0)
 	end
+	-- Repeats take no bytes, so like zero-byte items they come out of the
+	-- batch's allowance: sending the array again doesn't make them free.
+	if not rtrusted then
+		rzeroLeft -= count - runs
+		if rzeroLeft < 0 then
+			error("too many repeated strings", 0)
+		end
+	end
 	local runLengths = table.create(runs)
 	local runRepeats = table.create(runs)
 	local total = 0
@@ -2621,12 +2779,32 @@ local function sharePrefix(keys: { string }, count: number): boolean
 	return shared >= math.min(2, count - 1)
 end
 
+-- A map's reader for values that take no bytes (Instances): each comes out
+-- of the batch's allowance, since a map sent as a remembered key set carries
+-- no keys either and would otherwise cost nothing. Kept out of the map's own
+-- reader, which stays as small as it is for native code.
+local function chargedRead(read: () -> any): () -> any
+	return function(): any
+		if not rtrusted then
+			rzeroLeft -= 1
+			if rzeroLeft < 0 then
+				error("too many zero-byte items", 0)
+			end
+		end
+		return read()
+	end
+end
+
 local function stringKeyMap(value: Codec): Codec
 	local valueSize = value.size
 	local valueWriteRaw = value.writeRaw
-	local valueWrite, valueRead = value.write, value.read
+	local valueWrite = value.write
+	local valueRead = if value.minSize == 0 then chargedRead(value.read) else value.read
 	local valueMinSize = value.minSize
 	local isU8 = value.prim == PRIM_U8
+	-- Numbers and booleans: nothing to keep alive beyond their slot.
+	local valuePrim = value.prim
+	local plainValues = value.kind == "bool" or (valuePrim ~= nil and valuePrim <= PRIM_F64)
 	-- Values that can't add key sets themselves, so writing them can be undone.
 	local fixedValues = valueSize ~= nil and valueWriteRaw ~= nil
 
@@ -3004,7 +3182,15 @@ local function stringKeyMap(value: Codec): Codec
 			local shapes = rshapes :: Shapes
 			-- Unless its values' own key sets pushed it out already.
 			if shapes.keys[index] == keys and shapes.templates[index] == nil then
-				shapes.templates[index] = table.clone(result)
+				local template = table.clone(result)
+				-- Values like tables, strings or Instances would stay alive here,
+				-- outside the key-set memory's accounting: keep the keys only.
+				if not plainValues then
+					for position = 1, count do
+						template[keys[position]] = false
+					end
+				end
+				shapes.templates[index] = template
 			end
 		end
 		return result
@@ -4915,10 +5101,30 @@ autoReaders[TAG_COLOR3] = reader(Serdes.color3)
 autoReaders[TAG_CFRAME] = reader(Serdes.cframe)
 autoReaders[TAG_BUFFER] = reader(Serdes.buff)
 autoReaders[TAG_INSTANCE] = reader(Serdes.inst)
+-- Types `auto` sends with tags of their own. From a client, a ref holding one
+-- of them (or nothing) wasn't written by `auto` and is refused, so a table
+-- can't get past auto's depth limit this way.
+local AUTO_OWN_TYPES = {
+	["nil"] = true,
+	boolean = true,
+	number = true,
+	string = true,
+	table = true,
+	buffer = true,
+	Vector2 = true,
+	Vector3 = true,
+	CFrame = true,
+	Color3 = true,
+	Instance = true,
+}
 autoReaders[TAG_REF] = function()
 	rrefIndex += 1
 	local refs = rrefs
-	return if refs then refs[rrefIndex] else nil
+	local value = if refs then refs[rrefIndex] else nil
+	if not rtrusted and AUTO_OWN_TYPES[typeof(value)] then
+		error("auto: unexpected ref", 0)
+	end
+	return value
 end
 autoReaders[TAG_ARRAY] = function(depth: number)
 	if depth >= AUTO_MAX_DEPTH then
