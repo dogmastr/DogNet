@@ -10,7 +10,9 @@
 
 	Call ids go on the wire as varints and are reused smallest first, so with
 	fewer than 128 calls waiting they take one byte. The id of a call that
-	timed out stays unused for a while, in case its answer still comes.
+	timed out stays unused for a while, then comes back in a new generation
+	that's part of what goes on the wire, so if its answer still comes it
+	can't settle a later call.
 
 	Each query uses two ids: requests on `id`, responses on `id + 1`. Failures
 	for any query share one id and carry a reason code.
@@ -60,6 +62,7 @@ local SWEEP_INTERVAL = 0.25
 -- Seconds the id of a call that timed out stays unused.
 local QUARANTINE = 60
 -- Ids below 2^20 take at most three bytes. Only a backlog reaches past 16384.
+-- On the wire an id goes as itself plus its generation times this.
 local MAX_CALLS = 1048576
 -- Server only: ids calls to one player may hold, waiting or set aside after
 -- timing out. Every player's calls share the ids, so without this a few
@@ -74,7 +77,10 @@ local nextSweep = 0
 local freeIds: { number } = {}
 local freeCount = 0
 local freshId = 0
--- Ids of calls that timed out, and when each can be reused.
+-- How many times each id came back after its call timed out. Nil for none.
+local generations: { [number]: number } = {}
+-- Calls that timed out (by the call id they went out with), and when each
+-- one's id can be reused.
 local quarantined: { [number]: number } = {}
 local quarantineCount = 0
 -- Server only: the player each quarantined id's call went to, and how many
@@ -86,16 +92,20 @@ local function traceback(message: any): string
 	return debug.traceback(tostring(message), 2)
 end
 
--- The id the next call gets. Taken with `takeCallId` once its request is
--- written, so a request that fails to write leaves nothing to give back.
+-- The call id the next call gets: an id, plus its generation. Taken with
+-- `takeCallId` once its request is written, so a request that fails to
+-- write leaves nothing to give back.
 local function nextCallId(): number
+	local id: number
 	if freeCount > 0 then
-		return freeIds[freeCount]
-	end
-	if freshId >= MAX_CALLS then
+		id = freeIds[freeCount]
+	elseif freshId >= MAX_CALLS then
 		error("[DogNet] too many queries in flight", 3)
+	else
+		id = freshId
 	end
-	return freshId
+	local generation = generations[id]
+	return if generation then id + generation * MAX_CALLS else id
 end
 
 local function takeCallId()
@@ -109,7 +119,7 @@ end
 
 local function releaseCallId(callId: number)
 	freeCount += 1
-	freeIds[freeCount] = callId
+	freeIds[freeCount] = callId % MAX_CALLS
 end
 
 local function unhold(player: Player)
@@ -153,6 +163,7 @@ local function sweep()
 			if reuseAt <= now then
 				quarantined[callId] = nil
 				quarantineCount -= 1
+				generations[callId % MAX_CALLS] = callId // MAX_CALLS + 1
 				releaseCallId(callId)
 				local player = quarantinedFor[callId]
 				if player then

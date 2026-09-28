@@ -48,6 +48,9 @@ export type Channel = {
 	cursor: number,
 	refs: { any },
 	refCount: number,
+	-- Refs `cost` has looked into so far, and the bytes their contents add.
+	refsCounted: number,
+	refBytes: number,
 	-- Key sets the receiver remembers, on a reliable channel to one peer.
 	shapes: Shapes?,
 	-- Array codecs (their count keys) with a count written here without
@@ -194,6 +197,8 @@ function Serdes.channel(): Channel
 		cursor = 0,
 		refs = {},
 		refCount = 0,
+		refsCounted = 0,
+		refBytes = 0,
 		shapes = nil,
 		countKeys = nil,
 	}
@@ -391,15 +396,12 @@ function Serdes.reset(channel: Channel)
 	end
 	channel.cursor = 0
 	channel.refCount = 0
+	channel.refsCounted = 0
+	channel.refBytes = 0
 	channel.countKeys = nil
 	if next(channel.refs) ~= nil then
 		table.clear(channel.refs)
 	end
-end
-
--- Bytes the channel would cost on an UnreliableRemoteEvent.
-function Serdes.cost(channel: Channel): number
-	return channel.cursor + channel.refCount * REF_COST
 end
 
 -- Adds to `total` the least Roblox's encoding of `value` takes beyond its
@@ -459,6 +461,32 @@ function Serdes.refsCost(refs: { any }, limit: number): number?
 		end
 	end
 	return total
+end
+
+-- Past this many bytes of ref contents a channel is over any limit it's
+-- checked against, so `cost` stops looking inside tables.
+local REF_CONTENTS_LIMIT = 65536
+
+--[[
+	Bytes the channel would cost on an UnreliableRemoteEvent: its own, plus
+	REF_COST per ref and the contents of strings, buffers and tables among
+	them (`unknown` passes those), as `refsCost` counts them. Each ref is
+	looked into once, however often this is asked before a `reset`.
+]]
+function Serdes.cost(channel: Channel): number
+	local refCount = channel.refCount
+	local counted = channel.refsCounted
+	if counted < refCount then
+		local refs = channel.refs
+		local bytes = channel.refBytes
+		for index = counted + 1, refCount do
+			-- Tables nested deeper than `auto` allows count as too big.
+			bytes = addRefContents(refs[index], bytes, REF_CONTENTS_LIMIT, 0) or math.max(bytes, REF_CONTENTS_LIMIT)
+		end
+		channel.refsCounted = refCount
+		channel.refBytes = bytes
+	end
+	return channel.cursor + refCount * REF_COST + channel.refBytes
 end
 
 --[[
@@ -2499,7 +2527,8 @@ local function stringArray(): Codec
 	return {
 		kind = "var",
 		desc = "str[]",
-		minSize = 2,
+		-- An empty array is its count alone.
+		minSize = 1,
 		write = function(list: { string })
 			local count = #list
 			local needed = 16 + count
