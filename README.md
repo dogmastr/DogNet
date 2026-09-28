@@ -310,13 +310,13 @@ A data type says what a value is, so DogNet can send just the value and nothing 
 | `int8` | 1 byte | Whole numbers -128 to 127 |
 | `int16` | 2 bytes | Whole numbers -32,768 to 32,767 |
 | `int32` | 4 bytes | Whole numbers from about -2.1 billion to 2.1 billion |
-| `varuint` | 1 byte below 128, 2 below 16,384, and so on | Whole numbers 0 and up. Good for counts that are usually small but sometimes big. |
-| `varint` | 1 byte from -64 to 63, then more | Like `varuint`, but also negative |
+| `varuint` | 1 byte below 128, 2 below 16,384, and so on | Whole numbers 0 to 2^53. Good for counts that are usually small but sometimes big. |
+| `varint` | 1 byte from -64 to 63, then more | Whole numbers -2^52 to 2^52. Like `varuint`, but also negative. |
 | `float16` | 2 bytes | Decimals, about 3 significant digits, up to 65,504. 1,000.3 comes back as 1,000.5. |
 | `float32` | 4 bytes | Decimals, about 7 significant digits. Right for most decimals. |
 | `float64` | 8 bytes | Any Luau number, exactly |
 
-**Watch out:** a number that doesn't fit its type doesn't arrive as what you sent. 300 doesn't fit in a `uint8`, a negative number doesn't fit in a `uint` type, and 2.5 in any integer type loses the .5. When in doubt, go one size up.
+**Watch out:** a number that doesn't fit its type doesn't arrive as what you sent. 300 doesn't fit in a `uint8`, a negative number doesn't fit in a `uint` type, and 2.5 in any integer type loses the .5. When in doubt, go one size up. `varuint` and `varint` are the exception: a number outside their range (or NaN) makes the send error instead.
 
 ### Text, flags and raw data
 

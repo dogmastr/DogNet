@@ -883,6 +883,10 @@ function Serdes.process(
 	-- A stalled trusted batch keeps its place: set it aside and put it back after.
 	local stalled: { any }? = nil
 	if trustedStalled then
+		-- If a listener here resumes the thread suspended in it (with a
+		-- packet's `wait`, say), that thread must not go on reading with this
+		-- batch's cursor. `continueStalled` picks it up instead.
+		readerGeneration += 1
 		stalled = table.pack(
 			rbuff,
 			rlength,
@@ -1475,11 +1479,22 @@ Serdes.bool = {
 	end,
 } :: Codec
 
+-- Unlike a fixed-size number, a varint out of range doesn't just arrive wrong:
+-- a negative one ends in a byte that says more follow, which swallows the
+-- next message, and one past 2^56 can't be read at all. So they're refused.
 Serdes.varuint = {
 	kind = "var",
 	desc = "varuint",
 	minSize = 1,
-	write = writeVarUInt,
+	write = function(value: number)
+		if not (value >= 0 and value <= 2 ^ 53) then
+			error(`varuint holds whole numbers from 0 to 2^53, got {value}`, 0)
+		end
+		if wcursor + 8 > wsize then
+			grow(8)
+		end
+		writeVarUIntRaw(value)
+	end,
 	read = readVarUInt,
 } :: Codec
 
@@ -1489,6 +1504,9 @@ Serdes.varint = {
 	desc = "varint",
 	minSize = 1,
 	write = function(value: number)
+		if not (value >= -2 ^ 52 and value <= 2 ^ 52) then
+			error(`varint holds whole numbers from -2^52 to 2^52, got {value}`, 0)
+		end
 		writeVarUInt(if value >= 0 then value * 2 else -value * 2 - 1)
 	end,
 	read = function(): number
